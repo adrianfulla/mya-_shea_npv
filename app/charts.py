@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import plotly.graph_objects as go
 
 GREEN = "#008300"
@@ -308,6 +309,126 @@ def tornado_chart(rows, labels: dict) -> go.Figure:
     fig.update_xaxes(domain=[0, 0.88])
     _money_axis(fig.update_xaxes, "Package NPV (USD)")
     fig.update_xaxes(zeroline=False)
+    fig.update_yaxes(tickmode="array", tickvals=ys, ticktext=[labels[r["id"]] for r in rows], autorange=False,
+                     range=[n - 0.4, -1.3], showgrid=False, zeroline=False)
+    return fig
+
+
+# --- Optimal package: frontier and Monte Carlo ---------------------------------------------------
+
+def frontier_chart(rows, short: dict = SHORT) -> go.Figure:
+    """Best NPV against the capex budget, as a step line. Each step is labelled with what enters."""
+    rows = [r for r in rows if r["package"] is not None]
+    xs = [r["budget"] for r in rows]
+    ys = [r["package"]["objective"] for r in rows]
+    fig = go.Figure()
+    fig.add_scatter(
+        x=xs, y=ys, mode="lines", line=dict(color=ACCENT, width=2, shape="hv"), name="Best NPV within the budget",
+        customdata=[[usd(r["budget"]), usd(r["package"]["objective"]), " + ".join(short[o] for o in r["package"]["ids"]) or "No options"]
+                    for r in rows],
+        hovertemplate="Budget %{customdata[0]}<br>Best NPV %{customdata[1]}<br>%{customdata[2]}<extra></extra>",
+    )
+    steps = [r for i, r in enumerate(rows) if i == 0 or r["entered"] or r["left"]]
+    fig.add_scatter(
+        x=[r["budget"] for r in steps], y=[r["package"]["objective"] for r in steps], mode="markers",
+        marker=dict(size=9, color=ACCENT, line=dict(width=2, color="rgba(255,255,255,0.9)")), name="Package changes",
+        hoverinfo="skip",
+    )
+    for k, row in enumerate(steps):
+        entered = [short[o] for o in row["entered"]]
+        left = [short[o] for o in row["left"]]
+        text = " + ".join(entered) if entered else ""
+        if k == 0:
+            text = "Start: " + (text or "no options")
+        elif entered:
+            text = "+ " + text
+        if left:
+            text += (" " if text else "") + f"({MINUS} {', '.join(left)})"
+        late = xs[-1] > 0 and row["budget"] > 0.7 * xs[-1]  # near the right edge: put the label to the left
+        fig.add_annotation(x=row["budget"], y=row["package"]["objective"], text=text, showarrow=False,
+                           xanchor="right" if late else "left", yanchor="top", xshift=-8 if late else 6,
+                           yshift=-3 - 15 * (k % 2))
+    _layout(fig, height=420)
+    fig.update_xaxes(tickformat="$~s", title_text="Capex budget (present value, USD)", rangemode="tozero")
+    _money_axis(fig.update_yaxes, "Best NPV (USD)")
+    fig.update_yaxes(rangemode="tozero")
+    return fig
+
+
+def inclusion_chart(inclusion: dict, short: dict = SHORT) -> go.Figure:
+    """Share of Monte Carlo draws in which each option is in the optimal package."""
+    order = sorted(inclusion, key=lambda o: inclusion[o])
+    n = len(order)
+
+    def band(share):
+        return ACCENT if share >= 0.8 else GREY_LIGHT if share <= 0.2 else GREY
+
+    fig = go.Figure()
+    for name, color, keep in (("Robust yes (80% or more)", ACCENT, lambda s: s >= 0.8),
+                              ("In between", GREY, lambda s: 0.2 < s < 0.8),
+                              ("Robust no (20% or less)", GREY_LIGHT, lambda s: s <= 0.2)):
+        part = [(i, o) for i, o in enumerate(order) if keep(inclusion[o])]
+        fig.add_bar(orientation="h", y=[i for i, _ in part], x=[inclusion[o] for _, o in part], width=0.55,
+                    marker_color=color, name=name,
+                    customdata=[[short[o], pct(inclusion[o])] for _, o in part],
+                    hovertemplate="<b>%{customdata[0]}</b><br>In the best package in %{customdata[1]} of draws<extra></extra>")
+    for x in (0.2, 0.8):
+        fig.add_vline(x=x, line_width=1, line_color=GREY)
+    _text_column(fig, 1.0, [(i, pct(inclusion[o], 0)) for i, o in enumerate(order)], "Share of draws", n - 0.3)
+    _layout(fig, height=30 * n + 110)
+    fig.update_layout(barmode="overlay", barcornerradius=3)
+    fig.update_xaxes(domain=[0, 0.88], range=[0, 1], tickformat=".0%", title_text="Share of draws in which the option is in the best package")
+    fig.update_yaxes(tickmode="array", tickvals=list(range(n)), ticktext=[short[o] for o in order], range=[-0.7, n + 0.2],
+                     showgrid=False, zeroline=False)
+    return fig
+
+
+def npv_histogram(values, p10: float, p50: float, p90: float, now: float, bins: int = 40) -> go.Figure:
+    """Distribution of a package's NPV over the draws, with P10, P50, P90 and today's value marked."""
+    counts, edges = np.histogram(values, bins=bins)
+    centres = (edges[:-1] + edges[1:]) / 2
+    width = edges[1] - edges[0]
+    share = counts / max(1, len(values))
+    fig = go.Figure()
+    for name, color, keep in (("NPV below zero", RED, centres < 0), ("NPV of zero or more", GREY, centres >= 0)):
+        if keep.any():
+            fig.add_bar(x=centres[keep], y=share[keep], width=width * 0.92, marker_color=color, name=name,
+                        customdata=[[usd_short(a), usd_short(b), pct(s)] for a, b, s in
+                                    zip(edges[:-1][keep], edges[1:][keep], share[keep])],
+                        hovertemplate="%{customdata[0]} to %{customdata[1]}<br>%{customdata[2]} of draws<extra></extra>")
+    top = float(share.max()) if len(share) else 1.0
+    for label, x, anchor in (("P10", p10, "right"), ("P50", p50, "center"), ("P90", p90, "left")):
+        fig.add_vline(x=x, line_width=2, line_color=ACCENT)
+        fig.add_annotation(x=x, y=top * 1.16, text=f"<b>{label}</b> {usd_short(x)}", showarrow=False, xanchor=anchor,
+                           yanchor="bottom")
+    fig.add_vline(x=now, line_width=1, line_color=GREY_DARK)
+    fig.add_annotation(x=now, y=top * 1.04, text=f"At current inputs {usd_short(now)}", showarrow=False,
+                       xanchor="center", yanchor="bottom")
+    _layout(fig, height=400)
+    fig.update_layout(bargap=0, barmode="overlay", margin_t=60)
+    _money_axis(fig.update_xaxes, "NPV of the package (USD)")
+    fig.update_yaxes(tickformat=".0%", title_text="Share of draws", range=[0, top * 1.32])
+    return fig
+
+
+def spearman_chart(rows, labels: dict) -> go.Figure:
+    """Rank correlation between each sampled input and the optimal NPV, strongest first."""
+    n = len(rows)
+    ys = list(range(n))
+    fig = go.Figure()
+    for name, color, keep in (("Higher input, higher NPV", ACCENT, lambda r: r["rho"] >= 0),
+                              ("Higher input, lower NPV", GREY, lambda r: r["rho"] < 0)):
+        part = [(i, r) for i, r in enumerate(rows) if keep(r)]
+        fig.add_bar(orientation="h", y=[i for i, _ in part], x=[r["rho"] for _, r in part], width=0.5,
+                    marker_color=color, name=name,
+                    customdata=[[labels[r["id"]], f"{r['rho']:+.2f}".replace("-", MINUS)] for _, r in part],
+                    hovertemplate="<b>%{customdata[0]}</b><br>Rank correlation %{customdata[1]}<extra></extra>")
+    _text_column(fig, 1.0, [(i, f"{r['rho']:+.2f}".replace("-", MINUS)) for i, r in enumerate(rows)], "Correlation", -0.9)
+    _layout(fig, height=30 * n + 110)
+    fig.update_layout(barmode="overlay", barcornerradius=3)
+    reach = max([abs(r["rho"]) for r in rows] + [0.1]) * 1.15
+    fig.update_xaxes(domain=[0, 0.88], range=[-reach, reach], zeroline=True, zerolinecolor=GREY, zerolinewidth=1,
+                     title_text="Spearman rank correlation with the optimal NPV")
     fig.update_yaxes(tickmode="array", tickvals=ys, ticktext=[labels[r["id"]] for r in rows], autorange=False,
                      range=[n - 0.4, -1.3], showgrid=False, zeroline=False)
     return fig

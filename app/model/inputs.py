@@ -310,6 +310,11 @@ class InputState:
             out.update(overrides)
         return out
 
+    def signature(self) -> tuple:
+        """Hashable identity of the whole state, for caching results that depend on it."""
+        return (tuple(self.low.values()), tuple(self.base.values()), tuple(self.high.values()),
+                tuple(self.case.values()), tuple(sorted(self.custom.items())))
+
     def moved(self, specs) -> list:
         """Inputs whose active value differs from the workbook's base case: (id, workbook, now)."""
         ref = InputState.from_specs(specs).values()

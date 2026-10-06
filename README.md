@@ -31,17 +31,23 @@ recalculate a copy of the workbook; without it that case is skipped and says so.
 
 ```
 app/
-  streamlit_app.py      UI only: sidebar, seven tabs, widgets
+  streamlit_app.py      UI only: sidebar, eight tabs, widgets
   charts.py             number formatting and Plotly figures
+  narrative.py          the plain-language summary of the optimal package
   model/
     inputs.py           loads the workbook; Low/Base/High case and hazard-scenario logic; CSV
     engine.py           the model: pure functions, numpy, no Streamlit
-    sensitivity.py      tornado and scenario runs, computed live with the engine
+    sensitivity.py      tornado and scenario runs on a fixed package, with the engine
+    optimizer.py        evaluates and ranks all 8,192 packages on top of one engine run
+    robustness.py       tornado targets, switching values, scenario regret, Monte Carlo
   data/Shea_Resilience_NPV_Model.xlsx
 tests/
   workbook_map.py       maps every calculated workbook cell to an engine value
   test_parity.py        engine vs workbook (Excel's cached values, and a LibreOffice recalculation)
   test_checks.py        the ten model checks, package bridge, input state, table edits
+  test_optimizer.py     every package against the engine's Portfolio sheet; budget, forced options
+  test_robustness.py    tornado targets, switching values, scenarios, Monte Carlo
+  test_narrative.py     the generated summary
   test_app.py           the app run headless: widgets drive the engine, reruns take under a second
 MODEL_SPEC.md           every formula translated, with its workbook cell
 ```
@@ -57,12 +63,62 @@ MODEL_SPEC.md           every formula translated, with its workbook cell
 | Supply | `engine.supply` | Supply benefits in **Options** and **Package builder** |
 | Engine | `engine.option_cashflows` | **Options** tab (cash flows, NPV) |
 | Portfolio | `engine.portfolio`, `engine.npv_bridge` | **Package builder** tab |
+| Portfolio, for every package | `optimizer.evaluate_package`, `optimizer.optimize` | **Optimal package** tab |
 | Results | `engine.results` | **Overview** tab |
 | Checks | `engine.checks` | **Checks and sources** tab |
 | Sensitivity | `sensitivity.tornado`, `sensitivity.scenario_table` (live) | **Sensitivity** tab |
 | Gates, Source audit, Sources | read as data | **Options** and **Checks and sources** tabs |
 
 `MODEL_SPEC.md` lists each formula and the workbook cell it comes from.
+
+## Optimal package and how firm it is
+
+The **Optimal package** tab searches all 8,192 combinations of the 13 options on every rerun and
+shows the best one. The engine runs once per input set; a package is then array math that follows
+the Portfolio sheet (combined supply effects, the three interactions, tax on the combined flow).
+The search takes about a millisecond, so it follows every slider.
+
+- **Controls:** the objective (factory NPV, or factory plus supplier NPV), an optional cap on the
+  present value of capex, and a three-way switch per option (optimizer decides, force in, force
+  out).
+- **Package:** the best package, its NPV with and without supplier income, what it adds to and
+  drops from your Package builder selection, the top 10 packages, and a button that copies the
+  best package into Package builder.
+- **Budget frontier:** the best package at 25 capex budgets, as a step line labelled with what
+  enters at each step. It shows what to fund first.
+- **Scenarios:** the best package under Benign, Base and Stress, and what today's best package
+  would give up in each (regret).
+- **Switching values (on demand):** each input is moved across 15 points, from Low less 50% to
+  High plus 50%, and the package re-optimised. Where the best package changes, the threshold is
+  found by bisection to 1%. Sorted by distance from the value now.
+- **Monte Carlo (on demand):** independent triangular draws of every non-switch input,
+  re-optimised at each draw. Reports how often each option is in the best package, the NPV
+  distribution of today's best package, the most frequent best packages, and the inputs that
+  matter most (Spearman rank correlation).
+
+The **Sensitivity** tab's tornado can now target the Package builder selection, the optimal
+package held fixed, or the re-optimised NPV.
+
+The summary at the top of the tab is written from these results. Nothing in it is fixed text
+about a particular package.
+
+Choices made where the brief left room:
+
+- **Budget and capex.** The budget caps the Portfolio sheet's capex PV, which includes
+  replacements. "Upfront capex" is the first year of the timeline (the workbook's year 0).
+- **Ties.** A package that only adds an option with no effect (the PPA on top of owned PV, whose
+  benefit the interaction row cancels) ties with the leaner one. The leaner one wins and the
+  padded one is not listed.
+- **Whole-number inputs.** Lives and counts move in whole steps in scans and draws, because the
+  workbook's replacement logic (`MOD(year, life) = 0`) only works on whole years.
+- **Monte Carlo ranges.** The mode of each triangle is the input's value now (Base unless you
+  changed it). Hazard inputs are drawn inside the active scenario: around that scenario's value,
+  and no further than halfway to the neighbouring scenario.
+- **Independence.** Draws are independent. Risks that move together, such as drought and fire in
+  the same year, are not captured, so the tails are understated. The app says so next to the
+  results.
+- **Analyst assumptions.** After switching values are run, an option is flagged if any of the
+  five inputs closest to pushing it out of the package is tagged "Analyst assumption".
 
 ## How the inputs work
 
@@ -102,6 +158,8 @@ Edits made in the app live in your browser session only. They do not change the 
   LibreOffice reproduces Excel's cached values for the unchanged workbook.
 - **Sensitivity snapshot.** The live tornado and scenario runs reproduce the static values on the
   workbook's Sensitivity sheet.
+- **Optimizer.** All 8,192 packages are compared with the engine's Portfolio sheet at base values,
+  and random packages under seven other input sets. The default package evaluates to $260,114.90.
 
 Tolerance is 1e-6 absolute plus 1e-9 relative, tighter than the USD 1 the brief asked for.
 

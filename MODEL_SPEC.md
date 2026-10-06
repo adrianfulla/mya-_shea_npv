@@ -254,6 +254,32 @@ Workbook default: 2, 5, 7a, 7d, 8, 10 on.
 `Sensitivity` (static snapshot; the app recomputes it live and the tests use it as extra parity
 data), `Gates`, `Source audit`, `Sources`, `README`.
 
+## 11. Optimizer → `model/optimizer.py` (no new formulas)
+
+`precompute(values)` runs the engine once (`timeline`, `value_chain`, `calc`, `supply`,
+`option_cashflows`) and keeps each option's Engine rows. A package with include flags `inc` is
+then the Portfolio sheet as array math:
+
+| Portfolio row | In the optimizer |
+|---|---|
+| 21 Capex, 23 Other benefit, 27 Opex | `inc @ row` over the 13 option arrays |
+| 22 Supply benefit, combined | Supply rows 52-57, evaluated once for each of the 64 combinations of the six switches it reads (options 1, 2, 3, 5, 8, 9) |
+| 24 Flood works × insurance | `−inc6 × inc10 × (1−N05) × H05 × (c_rec0 − c_rec1)`, zero in year 0 |
+| 25 Battery × genset | `−inc7b × inc7d × other benefit_7b` |
+| 26 PPA × owned PV | `−inc7a × inc7c × other benefit_7c` |
+| 28-30 Operating flow, Tax, FCF | same formulas, FCF cut at G02a |
+| 31 Supplier income | `(inc @ supplier rows) × active` |
+| F5, F6, F7 | `npv`, `capex_pv`, `npv_with_suppliers` |
+
+`enumerate_packages` does this for all 8,192 packages at once. Everything except tax is linear
+in the include flags, so it reduces to one present value per option, per supply case and per
+interaction; only the taxed years are worked year by year. `tests/test_optimizer.py` compares
+every package with `engine.run_model`.
+
+`model/robustness.py` only calls the optimizer with different input values: Low and High
+(tornado), a scan plus bisection (switching values), the three scenarios, and triangular draws
+(Monte Carlo).
+
 ## Things to know (workbook behaviour the engine copies on purpose)
 
 1. **PV totals are not cut at the horizon.** Column C "NPV / total" cells are

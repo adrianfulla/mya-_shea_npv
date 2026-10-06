@@ -5,6 +5,7 @@ Run with:  streamlit run app/streamlit_app.py
 """
 from __future__ import annotations
 
+import html
 import math
 
 import numpy as np
@@ -12,9 +13,12 @@ import pandas as pd
 import streamlit as st
 
 import charts
+import narrative
 from charts import ARROW, SHORT, number, pct, usd, usd_short
-from model import engine, sensitivity
+from model import engine, optimizer, robustness, sensitivity
 from model.engine import OPTION_IDS
+from model.optimizer import OBJECTIVES
+from model.robustness import Settings
 from model.inputs import (CASE_LABELS, DEFAULT_WORKBOOK, SCENARIO_NAMES, InputState, apply_table_edits,
                           load_workbook_data)
 
@@ -83,6 +87,10 @@ def reset_to_base():
     ss.state = InputState.from_specs(WB.inputs)
     ss.include = dict(WB.include)
     ss.details = []
+    ss.opt = {"objective": OBJECTIVES[0], "budget_on": False, "budget": None,
+              "force": {oid: "auto" for oid in OPTION_IDS}}
+    ss.switching = None  # on-demand results: {"sig": ..., ...}
+    ss.mc = None
     ss.gen = ss.get("gen", 0) + 1  # new widget keys, so every widget is rebuilt from the state
 
 
@@ -277,6 +285,80 @@ MOVED = STATE.moved(WB.inputs)
 PACKAGE_CHANGED = ss.include != WB.include
 
 
+# --- optimizer: searched on every rerun, cached by a hash of the input values --------------------
+
+INPUT_IDS = tuple(VALUES)
+FORCE_LABELS = {"auto": "Optimizer decides", "in": "Force in", "out": "Force out"}
+METRIC_NAME = {OBJECTIVES[0]: "factory NPV", OBJECTIVES[1]: "factory + supplier NPV"}
+
+
+@st.cache_data(show_spinner=False, max_entries=300)
+def cached_search(wb_key: tuple, values_key: tuple, settings: Settings) -> dict:
+    """All 8,192 packages for one set of input values: the optimum, the top 10 and the budget frontier."""
+    enum = optimizer.enumerate_packages(dict(zip(INPUT_IDS, values_key)), WB.curves)
+    return {
+        "result": optimizer.optimize(enum, *settings),
+        "unconstrained": optimizer.best_package(enum, *settings._replace(budget=None)),
+        "frontier": optimizer.frontier(enum, settings.objective, 25, settings.forced_in, settings.forced_out),
+        "capex_ceiling": float(enum.capex_pv.max()),
+    }
+
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def cached_scenarios(wb_key: tuple, state_key: tuple, settings: Settings, _state) -> dict:
+    return robustness.scenario_robustness(_state, settings, WB.curves)
+
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def cached_tornado(wb_key: tuple, state_key: tuple, ids: tuple, settings: Settings, package_code, _state) -> list:
+    return robustness.tornado(_state, ids, settings, package_code, WB.curves)
+
+
+@st.cache_data(show_spinner=False, max_entries=2000)
+def cached_switching(wb_key: tuple, state_key: tuple, ids: tuple, settings: Settings, _state) -> list:
+    """Switching values for a slice of inputs. Slices are cached, so the progress bar sits outside."""
+    return robustness.switching_values(_state, SPECS, ids, settings, curves=WB.curves)
+
+
+@st.cache_data(show_spinner=False, max_entries=2000)
+def cached_draws(wb_key: tuple, state_key: tuple, settings: Settings, n: int, seed: int, start: int, stop: int,
+                 track: tuple, _state, _plan, _x) -> dict:
+    """One slice of Monte Carlo draws, keyed on the inputs, N and the seed (which fix `_plan` and `_x`)."""
+    return robustness.run_draws(_state, _plan, _x, start, stop, settings, dict(track), WB.curves)
+
+
+def current_settings() -> Settings:
+    opt = ss.opt
+    return Settings(
+        opt["objective"],
+        float(opt["budget"]) if opt["budget_on"] and opt["budget"] is not None else None,
+        tuple(oid for oid in OPTION_IDS if opt["force"][oid] == "in"),
+        tuple(oid for oid in OPTION_IDS if opt["force"][oid] == "out"),
+    )
+
+
+SETTINGS = current_settings()
+STATE_KEY = STATE.signature()
+SEARCH = cached_search(_WB_KEY, tuple(VALUES.values()), SETTINGS)
+OPTIMUM = SEARCH["result"]["best"]  # None when no package meets the budget and the forced options
+OBJECTIVE_KEY = "npv" if SETTINGS.objective == OBJECTIVES[0] else "npv_with_suppliers"
+CURRENT = {"code": optimizer.code_of(ss.include), "ids": tuple(o for o in OPTION_IDS if ss.include[o]),
+           "npv": PORT["npv"], "npv_with_suppliers": PORT["npv_with_suppliers"], "capex_pv": PORT["capex_pv"]}
+CURRENT["objective"] = CURRENT[OBJECTIVE_KEY]
+ss.opt["budget_default"] = (math.ceil(SEARCH["unconstrained"]["capex_pv"] / 5000) * 5000.0
+                            if SEARCH["unconstrained"] else 0.0)
+labels_full = {s.id: f"{s.id} {s.name}" for s in WB.inputs}
+CHIP = {  # evidence strength as an accent ramp: strong, light, neutral
+    "Local field evidence": "background-color: rgba(42, 120, 214, 0.45)",
+    "Transferable evidence": "background-color: rgba(42, 120, 214, 0.18)",
+    "Analyst assumption": "background-color: rgba(137, 135, 129, 0.35)",
+}
+SWITCH_SIG = (STATE_KEY, SETTINGS)
+MC_SIG = (STATE_KEY, SETTINGS, CURRENT["code"])
+SWITCHING = ss.switching["rows"] if ss.switching and ss.switching["sig"] == SWITCH_SIG else None
+MONTE_CARLO = ss.mc if ss.mc and ss.mc["sig"] == MC_SIG else None
+
+
 # --- sidebar: the main levers -------------------------------------------------------------------
 
 with st.sidebar:
@@ -321,8 +403,9 @@ ss.flash = []
 for message in RESULT["warnings"]:
     st.error(message)
 
-tab_overview, tab_package, tab_options, tab_chain, tab_inputs, tab_sens, tab_checks = st.tabs(
-    ["Overview", "Package builder", "Options", "Value chain", "Inputs", "Sensitivity", "Checks and sources"]
+tab_overview, tab_package, tab_optimal, tab_options, tab_chain, tab_inputs, tab_sens, tab_checks = st.tabs(
+    ["Overview", "Package builder", "Optimal package", "Options", "Value chain", "Inputs", "Sensitivity",
+     "Checks and sources"]
 )
 
 
@@ -482,6 +565,395 @@ with tab_package:
                        file_name="package_cash_flows.csv", mime="text/csv")
 
 
+# --- Optimal package ----------------------------------------------------------------------------
+
+def _on_objective(key: str):
+    ss.opt["objective"] = ss[key]
+
+
+def _on_budget_toggle(key: str):
+    ss.opt["budget_on"] = bool(ss[key])
+    if ss.opt["budget_on"] and ss.opt["budget"] is None:
+        ss.opt["budget"] = ss.opt.get("budget_default", 0.0)
+
+
+def _on_budget(key: str):
+    ss.opt["budget"] = float(ss[key]) * 1000.0
+
+
+def _on_force(oid: str, key: str):
+    ss.opt["force"][oid] = ss[key]
+
+
+def _use_package(ids: tuple):
+    ss.include = {oid: oid in ids for oid in OPTION_IDS}
+
+
+def package_label(ids) -> str:
+    return " + ".join(SHORT[o] for o in ids) if ids else "No options"
+
+
+def chips(ids, tone: str = "accent"):
+    """Options as chips. Accent for what is in, grey for what is out."""
+    color = "42, 120, 214" if tone == "accent" else "137, 135, 129"
+    style = (f"display:inline-block;padding:2px 12px;margin:0 6px 6px 0;border-radius:14px;"
+             f"background:rgba({color},0.18);border:1px solid rgba({color},0.65)")
+    names = [SHORT[o] for o in ids] or ["None"]
+    st.markdown("".join(f'<span style="{style}">{html.escape(name)}</span>' for name in names), unsafe_allow_html=True)
+
+
+def sig3(x: float) -> str:
+    """A number to three significant figures, with thousands separators: 0.487, 1,130, 0.5."""
+    if x == 0 or not math.isfinite(x):
+        return number(x)
+    text = number(x, max(0, 2 - math.floor(math.log10(abs(x)))))
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def value_text(iid: str, x: float) -> str:
+    """An input value with its unit, for sentences and tables: 0.487 m, 68.1%, $4.89/unit."""
+    spec = SPECS[iid]
+    if spec.is_percent:
+        return sig3(x * 100) + "%"
+    if spec.unit.startswith("USD"):
+        return usd(x, 0 if abs(x) >= 100 else 2) + spec.unit[3:]
+    return f"{sig3(x)} {spec.unit}"
+
+
+def sentence_name(iid: str) -> str:
+    """An input's name for the middle of a sentence: lower-case first letter unless it is an acronym."""
+    name = SPECS[iid].name
+    if len(name) > 1 and name[1].islower():
+        name = name[0].lower() + name[1:]
+    return f"{name} ({iid})"
+
+
+def run_switching() -> list:
+    """Scan every input in slices (each slice cached) with a progress bar. Returns sorted rows."""
+    ids = robustness.scannable(STATE, WB.inputs)
+    bar = st.progress(0.0, text="Scanning inputs…")
+    rows, size = [], 8
+    for start in range(0, len(ids), size):
+        rows += cached_switching(_WB_KEY, STATE_KEY, tuple(ids[start:start + size]), SETTINGS, STATE)
+        done = min(len(ids), start + size)
+        bar.progress(done / len(ids), text=f"Re-optimised across {done} of {len(ids)} inputs")
+    bar.empty()
+    return robustness.sort_switching(rows)
+
+
+def run_monte_carlo(n: int, seed: int) -> dict:
+    """Monte Carlo in slices (each slice cached on the inputs, N and the seed) with a progress bar."""
+    plan = robustness.sampling_plan(STATE, WB.inputs)
+    x = robustness.draw(plan, n, seed)
+    track = (("optimum", OPTIMUM["code"]), ("current", CURRENT["code"]))
+    bar = st.progress(0.0, text="Drawing inputs…")
+    parts, size = [], max(25, n // 40)
+    for start in range(0, n, size):
+        stop = min(n, start + size)
+        parts.append(cached_draws(_WB_KEY, STATE_KEY, SETTINGS, n, seed, start, stop, track, STATE, plan, x))
+        bar.progress(stop / n, text=f"Re-optimised {stop:,} of {n:,} draws")
+    bar.empty()
+    return robustness.summarise(plan, x, parts, dict(track))
+
+
+with tab_optimal:
+    summary_box = st.container()
+    metric_name = METRIC_NAME[SETTINGS.objective]
+
+    control_left, control_right = st.columns(2)
+    with control_left:
+        key = f"opt_objective|{ss.gen}"
+        if ss.get(key) != ss.opt["objective"]:
+            ss[key] = ss.opt["objective"]
+        st.radio("Objective", OBJECTIVES, format_func=lambda o: o[0].upper() + o[1:], key=key, horizontal=True,
+                 on_change=_on_objective, args=(key,),
+                 help="What the optimizer maximises. Supplier income is modelled for irrigation, apiaries and stoves.")
+    with control_right:
+        key = f"opt_budget_on|{ss.gen}"
+        if ss.get(key) != ss.opt["budget_on"]:
+            ss[key] = ss.opt["budget_on"]
+        st.toggle("Cap the capex budget", key=key, on_change=_on_budget_toggle, args=(key,),
+                  help="Limits the present value of capex, replacements included (Portfolio capex PV).")
+        if ss.opt["budget_on"]:
+            ceiling = math.ceil(SEARCH["capex_ceiling"] / 5000) * 5.0
+            shown = min(ceiling, max(0.0, (ss.opt["budget"] or 0.0) / 1000.0))
+            key = f"opt_budget|{ss.gen}"
+            if key not in ss or abs(ss[key] - shown) > 1e-9:
+                ss[key] = shown
+            st.slider("Capex budget, present value (USD thousand)", min_value=0.0, max_value=float(ceiling), step=5.0,
+                      format="$%dk", key=key, on_change=_on_budget, args=(key,))
+
+    forced = len(SETTINGS.forced_in) + len(SETTINGS.forced_out)
+    with st.expander(f"Force options in or out ({forced} forced)", expanded=forced > 0):
+        for start in range(0, len(OPTION_IDS), 3):
+            for column, oid in zip(st.columns(3), OPTION_IDS[start:start + 3]):
+                key = f"force|{oid}|{ss.gen}"
+                if ss.get(key) != ss.opt["force"][oid]:
+                    ss[key] = ss.opt["force"][oid]
+                column.radio(SHORT[oid], list(FORCE_LABELS), format_func=FORCE_LABELS.get, key=key, horizontal=True,
+                             on_change=_on_force, args=(oid, key))
+
+    if OPTIMUM is None:
+        st.error("No package meets the capex budget together with the options forced in. Raise the budget or "
+                 "release an option.")
+    else:
+        best = OPTIMUM
+        sub_package, sub_frontier, sub_scenarios, sub_switch, sub_mc = st.tabs(
+            ["Package", "Budget frontier", "Scenarios", "Switching values", "Monte Carlo"])
+
+        # ---- the package -----------------------------------------------------------------------
+        with sub_package:
+            gain = best["objective"] - CURRENT["objective"]
+            heading(f"Best package: {package_label(best['ids'])}, {metric_name} {usd_short(best['objective'])}")
+            chips(best["ids"])
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Factory NPV", usd(best["npv"]))
+            m2.metric("NPV incl. supplier income", usd(best["npv_with_suppliers"]))
+            m3.metric("Capex (PV)", usd(best["capex_pv"]))
+            m4.metric("Upfront capex (year 0)", usd(best["capex_year0"]),
+                      help="Capex in the first year of the timeline, before any replacements.")
+
+            st.markdown("**Compared with your Package builder selection**")
+            if best["code"] == CURRENT["code"]:
+                st.success("Your Package builder selection is already the best package under these settings.")
+            else:
+                added = [o for o in best["ids"] if o not in CURRENT["ids"]]
+                dropped = [o for o in CURRENT["ids"] if o not in best["ids"]]
+                side_a, side_b, side_c = st.columns([2, 2, 1])
+                with side_a:
+                    st.caption("Added by the optimizer")
+                    chips(added)
+                with side_b:
+                    st.caption("Dropped by the optimizer")
+                    chips(dropped, "grey")
+                side_c.metric("NPV gain", usd(gain, plus=True),
+                              help=f"Difference in {metric_name} between this package and your Package builder selection.")
+            st.button("Use this package in Package builder", on_click=_use_package, args=(best["ids"],),
+                      disabled=best["code"] == CURRENT["code"], type="primary")
+
+            st.markdown("**Top 10 packages**")
+            top = pd.DataFrame([
+                {"Rank": rank, "Package": package_label(pkg["ids"]), "Options": len(pkg["ids"]),
+                 "Factory NPV": pkg["npv"], "NPV incl. suppliers": pkg["npv_with_suppliers"],
+                 "Capex (PV)": pkg["capex_pv"], "Behind the best": pkg["objective"] - best["objective"]}
+                for rank, pkg in enumerate(SEARCH["result"]["top"], start=1)
+            ])
+            table(top.style.format({c: usd for c in ("Factory NPV", "NPV incl. suppliers", "Capex (PV)", "Behind the best")}))
+            st.caption(f"Ranked by {metric_name} across {SEARCH['result']['n_feasible']:,} feasible packages of 8,192. "
+                       "A package that only adds an option with no effect (the PPA on top of owned PV) is not listed twice.")
+            with st.expander("Annual cash flows of the best package"):
+                flows = optimizer.evaluate_package(VALUES, best["include"], WB.curves)["cashflows"]
+                frame = pd.DataFrame({
+                    "Year": flows["year"], "Capex": flows["capex"], "Supply benefit (combined)": flows["supply"],
+                    "Other benefit": flows["other"],
+                    "Interactions": flows["int_flood_ins"] + flows["int_bat_gen"] + flows["int_ppa_pv"],
+                    "Opex": flows["opex"], "Operating flow": flows["opflow"], "Tax": flows["tax"],
+                    "Free cash flow": flows["fcf"], "Supplier income": flows["supplier"],
+                })
+                table(frame.style.format({c: usd for c in frame.columns if c != "Year"}))
+
+        # ---- efficient frontier ----------------------------------------------------------------
+        with sub_frontier:
+            frontier = [r for r in SEARCH["frontier"] if r["package"] is not None]
+            if len(frontier) < 2:
+                st.info("The best package needs no capex, so there is no budget frontier to draw.")
+            else:
+                full = frontier[-1]["package"]["objective"]
+                enough = next((r for r in frontier if full > 0 and r["package"]["objective"] >= 0.8 * full), frontier[-1])
+                first = next((r for r in frontier if r["entered"] and r["budget"] > 0), None)
+                lead = (f"{usd_short(enough['budget'])} of capex captures "
+                        f"{pct(enough['package']['objective'] / full, 0)} of the best NPV ({usd_short(full)})"
+                        if full > 0 else f"The best NPV is {usd_short(full)}")
+                if first:
+                    lead += f"; fund {package_label(first['entered'])} first"
+                heading(lead)
+                chart(charts.frontier_chart(frontier), "frontier")
+                st.caption(md(f"The optimizer is run at 25 capex budgets, from $0 to {usd(frontier[-1]['budget'])}, the "
+                              f"capex of the best unconstrained package. Each step up is labelled with the options that "
+                              f"enter; options in brackets leave. Budget means the present value of capex, replacements "
+                              f"included. Objective: {metric_name}."))
+                steps = pd.DataFrame([
+                    {"Capex budget": r["budget"], "Best affordable package": package_label(r["package"]["ids"]),
+                     "Enters": package_label(r["entered"]) if r["entered"] else "",
+                     "Leaves": package_label(r["left"]) if r["left"] else "",
+                     "Best NPV": r["package"]["objective"], "Capex used": r["package"]["capex_pv"]}
+                    for i, r in enumerate(frontier) if i == 0 or r["entered"] or r["left"]
+                ])
+                table(steps.style.format({c: usd for c in ("Capex budget", "Best NPV", "Capex used")}))
+
+        # ---- scenario robustness ---------------------------------------------------------------
+        with sub_scenarios:
+            scen = cached_scenarios(_WB_KEY, STATE_KEY, SETTINGS, STATE)
+            rows_s = scen["scenarios"]
+            always = [o for o in OPTION_IDS if all(r["best"] and o in r["best"]["ids"] for r in rows_s.values())]
+            worst = max(rows_s.values(), key=lambda r: r["regret"] or 0.0)
+            lead = (f"{package_label(always)} {'is' if len(always) == 1 else 'are'} in the best package under all three "
+                    f"scenarios" if always else "No option is in the best package under all three scenarios")
+            if (worst["regret"] or 0.0) > 0.5:
+                lead += f"; today's best package gives up {usd_short(worst['regret'])} under {worst['name']}"
+            else:
+                lead += "; today's best package is also the best under every scenario"
+            heading(lead)
+            names_s = {code: f"{r['name']} (active)" if code == scen["active"] else r["name"] for code, r in rows_s.items()}
+            matrix = pd.DataFrame([
+                {"Option": OPTS[o]["name"],
+                 **{names_s[code]: "✓" if r["best"] and o in r["best"]["ids"] else "" for code, r in rows_s.items()},
+                 "Scenarios": sum(1 for r in rows_s.values() if r["best"] and o in r["best"]["ids"])}
+                for o in OPTION_IDS
+            ])
+            table(matrix, column_config={"Scenarios": st.column_config.NumberColumn("In how many", format="%d of 3")})
+            regret = pd.DataFrame([
+                {"Scenario": names_s[code],
+                 "Best package": package_label(r["best"]["ids"]) if r["best"] else "None feasible",
+                 "Best NPV": r["best"]["objective"] if r["best"] else float("nan"),
+                 "Today's best package there": r["reference"]["objective"],
+                 "Regret": r["regret"] if r["regret"] is not None else float("nan")}
+                for code, r in rows_s.items()
+            ])
+            table(regret.style.format({c: usd for c in ("Best NPV", "Today's best package there", "Regret")}))
+            st.caption(f"Each scenario is re-optimised with everything else as it is now ({metric_name}). Regret is what "
+                       f"today's best package ({package_label(best['ids'])}) would leave on the table if that scenario "
+                       "turned out to be the true one.")
+
+        # ---- switching values ------------------------------------------------------------------
+        with sub_switch:
+            scan_count = len(robustness.scannable(STATE, WB.inputs))
+            st.caption(f"What would have to be true for the recommendation to change? Each of the {scan_count} inputs "
+                       "with a Low to High range is moved, one at a time, across 15 points from Low less 50% to High "
+                       "plus 50%, and the package is re-optimised at each point. Where the best package changes, the "
+                       "threshold is located by bisection to 1%. Whole-number inputs, such as lives in years, move in "
+                       "whole steps.")
+            if st.button("Find switching values", key="run_switching"):
+                ss.switching = {"sig": SWITCH_SIG, "rows": run_switching()}
+                SWITCHING = ss.switching["rows"]
+            if SWITCHING is None:
+                st.info("Inputs or optimizer settings changed since the last run. Run it again to see the switching "
+                        "values for the current inputs." if ss.switching else
+                        "Not run yet. It takes a few seconds and is not repeated on every slider move.")
+            elif not SWITCHING:
+                heading("No single input changes the best package inside its scanned range")
+            else:
+                nearest = SWITCHING[0]
+                moves = ([f"{package_label(nearest['leaves'])} drops out"] if nearest["leaves"] else []) + \
+                        ([f"{package_label(nearest['enters'])} enters"] if nearest["enters"] else [])
+                heading(f"Closest flip: {labels_full[nearest['id']]} at {value_text(nearest['id'], nearest['threshold'])}, "
+                        f"{pct(nearest['distance'])} from its value now ({value_text(nearest['id'], nearest['current'])}): "
+                        f"{' and '.join(moves)}")
+                frame_sw = pd.DataFrame([
+                    {"Input": labels_full[r["id"]],
+                     "Now": value_text(r["id"], r["current"]),
+                     "Threshold": value_text(r["id"], r["threshold"]),
+                     "Direction": "rises above" if r["side"] == "above" else "falls below",
+                     "Distance": r["distance"],
+                     "Enters": package_label(r["enters"]) if r["enters"] else "",
+                     "Leaves": package_label(r["leaves"]) if r["leaves"] else "",
+                     "Within Low to High": "yes" if r["inside_low_high"] else "no",
+                     "Confidence tag": r["confidence"]}
+                    for r in SWITCHING
+                ])
+                table(frame_sw.style.format({"Distance": pct}).map(lambda tag: CHIP.get(tag, ""), subset=["Confidence tag"]),
+                      height=min(600, 35 * (len(frame_sw) + 1) + 3))
+                inside = sum(1 for r in SWITCHING if r["inside_low_high"])
+                st.caption(f"{len(SWITCHING)} flips across {len({r['id'] for r in SWITCHING})} inputs, closest first; "
+                           f"{inside} of them fall inside the input's own Low to High range. Distance is measured from "
+                           "the input's value now. One input at a time: flips that need two inputs to move together "
+                           "are not shown.")
+                flags = robustness.assumption_flags(SWITCHING, best["ids"])
+                for oid, flagged in flags.items():
+                    st.warning(md(
+                        f"**{SHORT[oid]} rests on analyst assumptions.** Among the five inputs closest to pushing it out "
+                        f"of the package, these are reasoned estimates, not sourced figures: "
+                        + "; ".join(f"{labels_full[r['id']]} (flips at {value_text(r['id'], r['threshold'])}, now "
+                                    f"{value_text(r['id'], r['current'])})" for r in flagged) + "."))
+                if not flags:
+                    st.caption("No option in the package has an analyst assumption among its five closest switching inputs.")
+
+        # ---- Monte Carlo -----------------------------------------------------------------------
+        with sub_mc:
+            mc_left, mc_right = st.columns([3, 1])
+            draws = mc_left.slider("Number of draws", min_value=200, max_value=5000, value=1000, step=100, key="mc_n")
+            seed = mc_right.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1, key="mc_seed",
+                                         help="The same seed gives the same draws.")
+            st.info("Every non-switch input is drawn independently from a triangular distribution (Low, its value "
+                    "now, High). Hazard inputs are drawn inside the active scenario: around that scenario's value and "
+                    "no further than halfway to the neighbouring scenario. **Risks that move together are not captured** "
+                    "(a drought year that is also a bad fire year, for example), so the tails shown here are narrower "
+                    "than the real ones.")
+            if st.button("Run Monte Carlo", key="run_mc"):
+                ss.mc = {"sig": MC_SIG, "n": int(draws), "seed": int(seed), "result": run_monte_carlo(int(draws), int(seed))}
+                MONTE_CARLO = ss.mc
+            if MONTE_CARLO is None:
+                st.info("Inputs, optimizer settings or the Package builder selection changed since the last run. Run it "
+                        "again." if ss.mc else "Not run yet. 1,000 draws take a few seconds.")
+            else:
+                mc = MONTE_CARLO["result"]
+                held, mine = mc["tracked"]["optimum"], mc["tracked"]["current"]
+                firm = [o for o in OPTION_IDS if mc["inclusion"][o] >= 0.8]
+                heading(f"Today's best package stays the best in {pct(mc['hold_share']['optimum'], 0)} of {mc['n']:,} "
+                        f"draws; {len(firm)} option{'s are' if len(firm) != 1 else ' is'} a robust yes"
+                        + (f" ({package_label(firm)})" if firm else ""))
+                chart(charts.inclusion_chart(mc["inclusion"]), "mc_inclusion")
+                st.caption(f"Share of draws in which each option is in the re-optimised best package ({metric_name}). "
+                           "80% or more is a robust yes; 20% or less is a robust no; in between, the choice depends on "
+                           "numbers that are not yet pinned down.")
+
+                heading(f"Today's best package: median {metric_name} {usd_short(held['p50'])}, "
+                        f"{pct(held['p_negative'])} chance of a loss")
+                chart(charts.npv_histogram(held["values"], held["p10"], held["p50"], held["p90"], best["objective"]),
+                      "mc_histogram")
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("P10", usd(held["p10"]))
+                q2.metric("P50 (median)", usd(held["p50"]))
+                q3.metric("P90", usd(held["p90"]))
+                q4.metric("P(NPV < 0)", pct(held["p_negative"]))
+                if best["objective"] and abs(held["p50"] - best["objective"]) > 0.05 * abs(best["objective"]):
+                    st.caption(md(f"The median ({usd_short(held['p50'])}) sits "
+                                  f"{'above' if held['p50'] > best['objective'] else 'below'} the value at current inputs "
+                                  f"({usd_short(best['objective'])}) because many Low to High ranges are not symmetric "
+                                  "around the value now."))
+                compare = pd.DataFrame([
+                    {"Package": name, "Options": package_label(ids), "P10": d["p10"], "P50": d["p50"], "P90": d["p90"],
+                     "Mean": d["mean"], "P(NPV < 0)": d["p_negative"], "Is the best package in": share}
+                    for name, ids, d, share in (
+                        ("Today's best package", best["ids"], held, mc["hold_share"]["optimum"]),
+                        ("Package builder selection", CURRENT["ids"], mine, mc["hold_share"]["current"]),
+                        ("Re-optimised at every draw", (), mc["optimal"], 1.0))
+                ])
+                compare.loc[2, "Options"] = "Varies by draw"
+                table(compare.style.format({**{c: usd for c in ("P10", "P50", "P90", "Mean")},
+                                            "P(NPV < 0)": pct, "Is the best package in": lambda v: pct(v, 0)}))
+
+                st.markdown("**Most frequent best packages**")
+                frequent = pd.DataFrame([{"Package": package_label(pkg["ids"]), "Draws": pkg["count"], "Share": pkg["share"]}
+                                         for pkg in mc["packages"]])
+                table(frequent.style.format({"Share": pct}))
+                st.caption(f"{mc['distinct_packages']} different packages came out best at least once.")
+
+                strongest = mc["spearman"][0]
+                rho_text = f"{strongest['rho']:+.2f}".replace("-", charts.MINUS)
+                heading(f"{labels_full[strongest['id']]} matters most for the best NPV (rank correlation {rho_text})")
+                chart(charts.spearman_chart(mc["spearman"], labels_full), "mc_spearman")
+                st.caption(f"Spearman rank correlation between each of the {mc['sampled_inputs']} sampled inputs and the "
+                           f"re-optimised {metric_name}, top 15. Seed {MONTE_CARLO['seed']}.")
+
+    # ---- plain-language summary, built from what has been computed -------------------------------
+    with summary_box:
+        sentences = narrative.summary(
+            OPTIMUM, CURRENT, SETTINGS, SHORT, value_text, sentence_name,
+            MONTE_CARLO["result"] if MONTE_CARLO else None, SWITCHING)
+        st.markdown(md(" ".join(sentences)))
+        missing = [(name, adds) for name, adds, done in (
+            ("Switching values", "what would flip it", SWITCHING is not None),
+            ("Monte Carlo", "how often it holds", MONTE_CARLO is not None)) if not done]
+        if missing and OPTIMUM is not None:
+            st.caption(f"Run {' and '.join(name for name, _ in missing)} below to add "
+                       f"{' and '.join(adds for _, adds in missing)}.")
+        if SWITCHING and OPTIMUM is not None:
+            for oid, flagged in robustness.assumption_flags(SWITCHING, OPTIMUM["ids"]).items():
+                st.caption(f"⚠ {SHORT[oid]} rests on analyst assumptions: "
+                           + ", ".join(labels_full[r["id"]] for r in flagged) + ".")
+
+
 # --- Options ------------------------------------------------------------------------------------
 
 def gate_for(oid: str):
@@ -586,13 +1058,6 @@ with tab_chain:
 
 
 # --- Inputs -------------------------------------------------------------------------------------
-
-CHIP = {  # evidence strength as an accent ramp: strong, light, neutral
-    "Local field evidence": "background-color: rgba(42, 120, 214, 0.45)",
-    "Transferable evidence": "background-color: rgba(42, 120, 214, 0.18)",
-    "Analyst assumption": "background-color: rgba(137, 135, 129, 0.35)",
-}
-
 
 def _on_edit(key: str, ids: list):
     ss.details, problems = apply_table_edits(ss.state, SPECS, ids, ss[key].get("edited_rows", {}), ss.details)
@@ -700,33 +1165,65 @@ with tab_inputs:
 
 # --- Sensitivity --------------------------------------------------------------------------------
 
+TORNADO_TARGETS = ["Current Package builder selection", "Optimal package, held fixed",
+                   "Re-optimized at each Low and High"]
+
 with tab_sens:
-    labels = {s.id: f"{s.id} {s.name}" for s in WB.inputs}
+    target = st.radio("Tornado target", TORNADO_TARGETS, horizontal=True, key="tornado_target",
+                      help="What the tornado measures. The optimal package, its objective, budget and forced options "
+                           "are set on the Optimal package tab.")
     picked = st.multiselect("Inputs in the tornado", [s.id for s in WB.inputs], default=WB.sensitivity_ids,
-                            format_func=labels.get, key=f"tornado_pick|{ss.gen}",
+                            format_func=labels_full.get, key=f"tornado_pick|{ss.gen}",
                             help="Default: the inputs in the workbook's Sensitivity sheet.")
-    if not any(PORT["include"].values()):
-        st.info(md("No option is selected, so the package NPV is $0 whatever the inputs. Pick options in Package builder."))
-    elif picked:
-        tornado = sensitivity.tornado(STATE, ss.include, picked, UNITS, WB.curves)
-        top = tornado[0]
-        flips = [r for r in tornado if min(r["npv_low"], r["npv_high"]) < 0 <= r["base_npv"]]
-        ending = (f"; {len(flips)} input{'s' if len(flips) != 1 else ''} can turn the package negative"
-                  if flips else "; the package stays positive across every Low and High") if PORT["npv"] >= 0 else ""
-        heading(f"{labels[top['id']]} moves the package NPV most: {usd_short(top['swing'])} between its Low and "
-                f"High{ending}")
-        chart(charts.tornado_chart(tornado, labels), "tornado")
+    metric_name = METRIC_NAME[SETTINGS.objective]
+    reoptimised = target == TORNADO_TARGETS[2]
+    if target == TORNADO_TARGETS[0]:
+        package_code, subject, ready = CURRENT["code"], "the Package builder selection", any(ss.include.values())
+        blocked = "No option is selected, so the package NPV is $0 whatever the inputs. Pick options in Package builder."
+    else:
+        package_code = None if reoptimised else (OPTIMUM["code"] if OPTIMUM else None)
+        subject = "the re-optimised best package" if reoptimised else "today's best package, held fixed,"
+        ready = OPTIMUM is not None
+        blocked = "No package meets the budget and the forced options set on the Optimal package tab."
+    if not ready:
+        st.info(md(blocked))
+    elif not picked:
+        st.info("Pick at least one input to draw the tornado.")
+    else:
+        tornado = cached_tornado(_WB_KEY, STATE_KEY, tuple(picked), SETTINGS if reoptimised else Settings(SETTINGS.objective),
+                                 package_code, STATE)
+        top, now = tornado[0], tornado[0]["base_npv"]
+        if reoptimised:
+            changed = sum(r["changes_low"] + r["changes_high"] for r in tornado)
+            ending = f"; the best package changes at {changed} of the {2 * len(tornado)} Low and High points"
+        elif now >= 0:
+            flips = [r for r in tornado if min(r["npv_low"], r["npv_high"]) < 0]
+            ending = (f"; {len(flips)} input{'s' if len(flips) != 1 else ''} can turn the package negative"
+                      if flips else "; the package stays positive across every Low and High")
+        else:
+            ending = ""
+        heading(f"{labels_full[top['id']]} moves {subject} most: {usd_short(top['swing'])} of {metric_name} between "
+                f"its Low and High{ending}")
+        chart(charts.tornado_chart(tornado, labels_full), "tornado")
         st.caption(md(f"Each input is set to its Low and its High with everything else as it is now. The vertical "
-                      f"line is the package NPV now ({usd(PORT['npv'])}). Computed live: {2 * len(picked)} engine runs."))
+                      f"line is the {metric_name} now ({usd(now)}). Computed live: {2 * len(picked)} "
+                      + ("full searches of all 8,192 packages." if reoptimised else "package evaluations.")))
+
+        def package_at(row, side):
+            if not reoptimised:
+                return None
+            return package_label(row[f"package_{side}"]) if row[f"changes_{side}"] else "No change"
+
         frame_t = pd.DataFrame([
-            {"Input": labels[r["id"]], "NPV at Low": r["npv_low"], "NPV at High": r["npv_high"], "Swing": r["swing"],
+            {"Input": labels_full[r["id"]], "NPV at Low": r["npv_low"], "NPV at High": r["npv_high"], "Swing": r["swing"],
              "NPV now": r["base_npv"],
-             "Reading": "Package stays positive" if min(r["npv_low"], r["npv_high"]) >= 0 else "Package can turn negative"}
+             **({"Best package at Low": package_at(r, "low"), "Best package at High": package_at(r, "high")}
+                if reoptimised else
+                {"Reading": "Package stays positive" if min(r["npv_low"], r["npv_high"]) >= 0
+                 else "Package can turn negative"})}
             for r in tornado
         ])
         table(frame_t.style.format({c: usd for c in ("NPV at Low", "NPV at High", "Swing", "NPV now")}))
-    else:
-        st.info("Pick at least one input to draw the tornado.")
 
     st.markdown("**Factory NPV of every option under the three hazard scenarios**")
     scen = pd.DataFrame([{"Option": r["name"], "Benign": r["benign"], "Base": r["base"], "Stress": r["stress"],
